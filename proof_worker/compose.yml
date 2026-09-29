@@ -1,0 +1,46 @@
+services:
+  worker:
+    image: ${ZYLITH_PROOF_WORKER_IMAGE:?set a digest-pinned worker image}
+    env_file:
+      - .env
+    environment:
+      ZYLITH_STWO_PROVER_URL: http://stwo:3100
+    depends_on:
+      stwo:
+        condition: service_healthy
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - proof
+      - control
+
+  stwo:
+    image: ${ZYLITH_STWO_IMAGE:?set a digest-pinned stwo image}
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=8g,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "3100"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/stwo-healthcheck"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+    networks:
+      - proof
+
+networks:
+  proof:
+    internal: true
+  control:
