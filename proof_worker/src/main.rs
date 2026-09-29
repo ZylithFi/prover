@@ -51,6 +51,9 @@ struct Worker {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| "failed to install the tls crypto provider".to_string())?;
     let required = |name: &str| {
         env::var(name)
             .ok()
