@@ -1,10 +1,17 @@
 services:
   worker:
     image: ${ZYLITH_PROOF_WORKER_IMAGE:?set a digest-pinned worker image}
-    env_file:
-      - .env
     environment:
+      ZYLITH_PROOF_QUEUE_URL: ${ZYLITH_PROOF_QUEUE_URL:?set the proof queue url}
+      ZYLITH_PROOF_WORKER_REGISTRATION_TOKEN: ${ZYLITH_PROOF_WORKER_REGISTRATION_TOKEN:?set the one-time worker grant}
+      ZYLITH_PROOF_WORKER_ID: ${ZYLITH_PROOF_WORKER_ID:?set a unique worker id}
+      ZYLITH_PROVER_BUILD_ID: ${ZYLITH_PROVER_BUILD_ID:?set the prover build id}
+      ZYLITH_PROOF_VERSION: ${ZYLITH_PROOF_VERSION:?set the proof version}
+      ZYLITH_VIRTUAL_PROGRAM_HASH: ${ZYLITH_VIRTUAL_PROGRAM_HASH:?set the virtual program hash}
+      ZYLITH_STARKNET_OS_CONFIG_HASH: ${ZYLITH_STARKNET_OS_CONFIG_HASH:?set the os config hash}
       ZYLITH_STWO_PROVER_URL: http://stwo:3100
+      ZYLITH_PROOF_WORKER_POLL_MS: ${ZYLITH_PROOF_WORKER_POLL_MS:-250}
+      ZYLITH_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS: ${ZYLITH_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS:-900}
     depends_on:
       stwo:
         condition: service_healthy
@@ -22,6 +29,20 @@ services:
 
   stwo:
     image: ${ZYLITH_STWO_IMAGE:?set a digest-pinned stwo image}
+    environment:
+      RPC_URL: ${ZYLITH_STWO_RPC_URL:?set the starknet rpc url}
+      CHAIN_ID: ${ZYLITH_STWO_CHAIN_ID:?set the starknet chain id}
+      PROVER_IP: 0.0.0.0
+      PROVER_PORT: "3100"
+      MAX_CONCURRENT_REQUESTS: ${ZYLITH_STWO_MAX_CONCURRENT_REQUESTS:-1}
+      MAX_QUEUED_REQUESTS: ${ZYLITH_STWO_MAX_QUEUED_REQUESTS:-0}
+      QUEUE_WAIT_TIMEOUT_MILLIS: ${ZYLITH_STWO_QUEUE_WAIT_TIMEOUT_MILLIS:-1000}
+      MAX_CONNECTIONS: ${ZYLITH_STWO_MAX_CONNECTIONS:-2}
+      PREFETCH_STATE: ${ZYLITH_STWO_PREFETCH_STATE:-true}
+      USE_LATEST_VERSIONED_CONSTANTS: "true"
+      COMPILED_CLASS_CACHE_SIZE: ${ZYLITH_STWO_COMPILED_CLASS_CACHE_SIZE:-64}
+      MAX_REQUEST_BODY_SIZE: ${ZYLITH_STWO_MAX_REQUEST_BODY_SIZE:-67108864}
+      LOG_FORMAT: json
     restart: "no"
     read_only: true
     tmpfs:
@@ -33,14 +54,17 @@ services:
     expose:
       - "3100"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/stwo-healthcheck"]
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/3100'"]
       interval: 2s
       timeout: 1s
-      retries: 30
+      retries: 150
+      start_period: 10s
     networks:
       - proof
+      - rpc
 
 networks:
   proof:
     internal: true
   control:
+  rpc:

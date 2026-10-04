@@ -20,4 +20,14 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
           cargo build --locked --release -p zylith-proof-worker
-      - run: node --check proof_worker/run.mjs
+      - run: |
+          node --check proof_worker/run.mjs
+          cp proof_worker/.env.example proof_worker/.env
+          ZYLITH_PROOF_WORKER_IMAGE=ghcr.io/zylithfi/prover@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+          ZYLITH_STWO_IMAGE=ghcr.io/starkware-libs/starknet-privacy/transaction-prover@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+          ZYLITH_PROOF_WORKER_REGISTRATION_TOKEN=ci-registration-token \
+          ZYLITH_PROVER_BUILD_ID=ci-build \
+          ZYLITH_PROOF_VERSION=ci-proof \
+          ZYLITH_VIRTUAL_PROGRAM_HASH=0x1 \
+          ZYLITH_STARKNET_OS_CONFIG_HASH=0x2 \
+            docker compose -f proof_worker/compose.yml config >/dev/null

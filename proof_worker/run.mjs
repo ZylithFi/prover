@@ -5,6 +5,9 @@ import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+const directory = dirname(fileURLToPath(import.meta.url));
+process.loadEnvFile(join(directory, ".env"));
+
 for (const name of ["ZYLITH_PROOF_WORKER_IMAGE", "ZYLITH_STWO_IMAGE"]) {
   const value = process.env[name]?.trim() ?? "";
   if (!/@sha256:[0-9a-f]{64}$/i.test(value)) {
@@ -12,7 +15,7 @@ for (const name of ["ZYLITH_PROOF_WORKER_IMAGE", "ZYLITH_STWO_IMAGE"]) {
   }
 }
 
-const compose = join(dirname(fileURLToPath(import.meta.url)), "compose.yml");
+const compose = join(directory, "compose.yml");
 const result = spawnSync(
   "docker",
   ["compose", "-f", compose, "up", "--abort-on-container-exit", "--remove-orphans"],

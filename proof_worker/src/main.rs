@@ -34,7 +34,8 @@ struct ProveResult {
 #[derive(Deserialize)]
 struct ProveError {
     code: i64,
-    message: String,
+    #[serde(rename = "message")]
+    _message: String,
 }
 
 struct Worker {
@@ -328,7 +329,7 @@ impl Worker {
             .config
             .lease_duration_ms;
         let (stop_heartbeat, heartbeat_stop) = watch::channel(false);
-        let heartbeat = tokio::spawn(renew_lease(
+        let mut heartbeat = tokio::spawn(renew_lease(
             self.http.clone(),
             self.queue_url.clone(),
             token.clone(),
@@ -355,11 +356,7 @@ impl Worker {
             let result = match (response.result, response.error) {
                 (Some(result), None) => result,
                 (_, Some(error)) => {
-                    return Err(format!(
-                        "stwo prover error {}: {}",
-                        error.code,
-                        sanitize(&error.message)
-                    ));
+                    return Err(prover_error(error.code));
                 }
                 _ => return Err("stwo prover returned no result".into()),
             };
@@ -393,13 +390,26 @@ impl Worker {
                 ));
             }
             Ok(())
+        };
+        tokio::pin!(completion);
+        tokio::select! {
+            completion = &mut completion => {
+                let _ = stop_heartbeat.send(true);
+                heartbeat
+                    .await
+                    .map_err(|error| format!("proof lease heartbeat task: {error}"))??;
+                completion?;
+            }
+            heartbeat = &mut heartbeat => {
+                match heartbeat {
+                    Ok(Ok(())) => return Err("proof lease heartbeat stopped unexpectedly".into()),
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => {
+                        return Err(format!("proof lease heartbeat task: {error}"));
+                    }
+                }
+            }
         }
-        .await;
-        let _ = stop_heartbeat.send(true);
-        heartbeat
-            .await
-            .map_err(|error| format!("proof lease heartbeat task: {error}"))??;
-        completion?;
         eprintln!("proof job complete");
         Ok(())
     }
@@ -500,14 +510,30 @@ async fn read_bounded(response: reqwest::Response, max_bytes: usize) -> Result<V
 }
 
 fn sanitize(value: &str) -> String {
-    value
-        .split_whitespace()
-        .take(32)
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(512)
-        .collect()
+    let mut output = String::new();
+    let mut run = String::new();
+    let flush = |run: &mut String, output: &mut String| {
+        if run.len() >= 32 {
+            output.push_str("<redacted>");
+        } else {
+            output.push_str(run);
+        }
+        run.clear();
+    };
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            run.push(character);
+        } else {
+            flush(&mut run, &mut output);
+            output.push(character);
+        }
+    }
+    flush(&mut run, &mut output);
+    output.chars().take(512).collect()
+}
+
+fn prover_error(code: i64) -> String {
+    format!("stwo prover error code {code}")
 }
 
 fn now_ms() -> u64 {
@@ -594,5 +620,17 @@ mod tests {
             Duration::from_secs(900),
             60_000,
         ));
+    }
+
+    #[test]
+    fn prover_errors_cannot_echo_witness_values() {
+        let secret_hex = format!("0x{}", "ab".repeat(32));
+        let secret_decimal = "1234567890123456789012345678901234567890";
+        let message = format!("invalid witness {secret_hex} at value {secret_decimal}");
+        let sanitized = sanitize(&message);
+        assert!(!sanitized.contains(&secret_hex));
+        assert!(!sanitized.contains(secret_decimal));
+        assert_eq!(sanitized.matches("<redacted>").count(), 2);
+        assert_eq!(prover_error(-32_001), "stwo prover error code -32001");
     }
 }
