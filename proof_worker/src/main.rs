@@ -1,17 +1,20 @@
 //! disposable proof worker: claims immutable jobs, invokes a local stwo engine and returns proofs.
 
 use std::env;
+use std::fmt;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use reqwest::{Client, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, de::IgnoredAny};
 use sha2::Sha256;
 use tokio::sync::watch;
 use tokio::time::sleep;
 use url::Url;
+use zeroize::Zeroizing;
 use zylith_proof_job::{
-    CompleteProofJob, ProofJobClaim, ProofJobLeaseRequest, ProofPayload, RegisterProofWorker,
+    CompleteProofJob, FailProofJob, ProofFailure, ProofFailureClass, ProofJobClaim,
+    ProofJobLeaseRequest, ProofPayload, ProofResourceUsage, RegisterProofWorker,
     RegisterProofWorkerResponse, WorkerCapabilities, WorkerSessionConfig, constant_time_eq,
     proof_artifact_hash,
 };
@@ -20,22 +23,59 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const TERMINAL_CREDENTIAL_ERROR: &str = "terminal worker credentials:";
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProveResponse {
+    jsonrpc: String,
+    id: u64,
     result: Option<ProveResult>,
     error: Option<ProveError>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProveResult {
     proof: String,
     proof_facts: Vec<String>,
+    #[serde(default)]
+    resource_usage: Option<ProofResourceUsage>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProveError {
     code: i64,
     #[serde(rename = "message")]
-    _message: String,
+    _message: IgnoredAny,
+    data: Option<StructuredProverFailure>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredProverFailure {
+    schema_version: u32,
+    class: ProofFailureClass,
+    code: String,
+    component: Option<String>,
+    profile_id: Option<String>,
+    required: Option<u64>,
+    available: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedReadError {
+    TooLarge { maximum: usize },
+    Transport,
+}
+
+impl fmt::Display for BoundedReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { maximum } => {
+                write!(formatter, "response exceeds {maximum} bytes")
+            }
+            Self::Transport => formatter.write_str("response read failed"),
+        }
+    }
 }
 
 struct Worker {
@@ -108,9 +148,9 @@ async fn main() -> Result<(), String> {
         capabilities: WorkerCapabilities {
             prover_build_id,
             proof_version,
-            program_variant: "VIRTUAL_SNOS".into(),
+            program_variant: zylith_proof_job::VIRTUAL_PROGRAM_VARIANT.into(),
             virtual_program_hash,
-            starknet_os_output_version: "VIRTUAL_SNOS0".into(),
+            starknet_os_output_version: zylith_proof_job::STARKNET_OS_OUTPUT_VERSION.into(),
             starknet_os_config_hash,
         },
         poll_interval: Duration::from_millis(poll_ms),
@@ -123,6 +163,9 @@ async fn main() -> Result<(), String> {
         match worker.claim().await {
             Ok(Some(claim)) => {
                 if let Err(error) = worker.prove(claim).await {
+                    if error.starts_with(TERMINAL_CREDENTIAL_ERROR) {
+                        return Err(error);
+                    }
                     eprintln!("proof job failed: {}", sanitize(&error));
                 }
             }
@@ -224,6 +267,7 @@ impl Worker {
         if config.worker_id != self.worker_id || config.capabilities != self.capabilities {
             return Err("coordinator signed a session for another worker build".into());
         }
+        validate_worker_resource_limits(config.lease_duration_ms, config.max_request_bytes)?;
         let required_lifetime =
             required_session_lifetime(self.max_proof_duration, config.lease_duration_ms);
         if config.session_expires_at_unix_ms < now_ms().saturating_add(required_lifetime) {
@@ -287,6 +331,20 @@ impl Worker {
 
     async fn prove(&mut self, claim: ProofJobClaim) -> Result<(), String> {
         let token = self.token().await?;
+        let max_request_bytes = self
+            .session
+            .as_ref()
+            .expect("worker has a session")
+            .config
+            .max_request_bytes;
+        let request_bytes =
+            match bounded_request_size(claim.descriptor.request_bytes, max_request_bytes) {
+                Ok(request_bytes) => request_bytes,
+                Err(failure) => {
+                    self.report_failure(&token, &claim, failure).await?;
+                    return Err("proof artifact exceeds the signed worker limit".into());
+                }
+            };
         let response = self
             .http
             .get(format!("{}{}", self.queue_url, claim.artifact_path))
@@ -294,16 +352,71 @@ impl Worker {
             .send()
             .await
             .map_err(|error| format!("artifact fetch: {error}"))?;
-        if !response.status().is_success() {
+        let artifact_status = response.status();
+        if matches!(
+            artifact_status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            self.session = None;
             return Err(format!(
-                "artifact fetch returned http {}",
-                response.status()
+                "{TERMINAL_CREDENTIAL_ERROR} artifact fetch was rejected"
             ));
         }
-        let artifact = read_bounded(response, claim.descriptor.request_bytes as usize).await?;
+        if !artifact_status.is_success() {
+            if artifact_status.is_server_error()
+                || matches!(
+                    artifact_status,
+                    StatusCode::REQUEST_TIMEOUT
+                        | StatusCode::TOO_EARLY
+                        | StatusCode::TOO_MANY_REQUESTS
+                )
+            {
+                return Err(format!("artifact fetch returned http {artifact_status}"));
+            }
+            self.report_failure(
+                &token,
+                &claim,
+                proof_failure(
+                    ProofFailureClass::InvalidArtifact,
+                    "ARTIFACT_FETCH_REJECTED",
+                    None,
+                ),
+            )
+            .await?;
+            return Err(format!("artifact fetch returned http {artifact_status}"));
+        }
+        let artifact = match read_bounded(response, request_bytes).await {
+            Ok(artifact) => artifact,
+            Err(BoundedReadError::TooLarge { .. }) => {
+                self.report_failure(
+                    &token,
+                    &claim,
+                    proof_failure(
+                        ProofFailureClass::InvalidArtifact,
+                        "ARTIFACT_TOO_LARGE",
+                        None,
+                    ),
+                )
+                .await?;
+                return Err("proof artifact exceeds its pinned size".into());
+            }
+            Err(BoundedReadError::Transport) => {
+                return Err("proof artifact response read failed".into());
+            }
+        };
         if artifact.len() as u64 != claim.descriptor.request_bytes
             || proof_artifact_hash(&artifact) != claim.descriptor.request_hash
         {
+            self.report_failure(
+                &token,
+                &claim,
+                proof_failure(
+                    ProofFailureClass::InvalidArtifact,
+                    "ARTIFACT_MISMATCH",
+                    None,
+                ),
+            )
+            .await?;
             return Err("proof artifact failed its size or hash check".into());
         }
         let response = self
@@ -319,6 +432,15 @@ impl Worker {
             .send()
             .await
             .map_err(|error| format!("proof start: {error}"))?;
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            self.session = None;
+            return Err(format!(
+                "{TERMINAL_CREDENTIAL_ERROR} proof start was rejected"
+            ));
+        }
         if !response.status().is_success() {
             return Err(format!("proof lease is stale ({})", response.status()));
         }
@@ -339,34 +461,22 @@ impl Worker {
             heartbeat_stop,
         ));
         let completion = async {
-            let response = self
-                .http
-                .post(&self.stwo_url)
-                .header("content-type", "application/json")
-                .body(artifact)
-                .send()
-                .await
-                .map_err(|error| format!("stwo prover: {error}"))?;
-            if !response.status().is_success() {
-                return Err(format!("stwo prover returned http {}", response.status()));
-            }
-            let bytes = read_bounded(response, MAX_RESPONSE_BYTES).await?;
-            let response: ProveResponse = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("stwo response: {error}"))?;
-            let result = match (response.result, response.error) {
-                (Some(result), None) => result,
-                (_, Some(error)) => {
-                    return Err(prover_error(error.code));
+            let result = match self.run_prover(artifact).await {
+                Ok(result) => result,
+                Err(failure) => {
+                    let code = failure.code.clone();
+                    self.report_failure(&token, &claim, failure).await?;
+                    return Err(format!("stwo prover failed with {code}"));
                 }
-                _ => return Err("stwo prover returned no result".into()),
             };
             let completion = CompleteProofJob {
-                lease_id: claim.lease_id,
+                lease_id: claim.lease_id.clone(),
                 prover_build_id: self.capabilities.prover_build_id.clone(),
-                request_hash: claim.descriptor.request_hash,
+                request_hash: claim.descriptor.request_hash.clone(),
                 result: ProofPayload {
                     proof: result.proof,
                     proof_facts: result.proof_facts,
+                    resource_usage: result.resource_usage,
                 },
             };
             let response = self
@@ -375,13 +485,34 @@ impl Worker {
                     "{}/internal/proof-jobs/{}/complete",
                     self.queue_url, claim.descriptor.job_id
                 ))
-                .bearer_auth(token)
+                .bearer_auth(&token)
                 .json(&completion)
                 .send()
                 .await
                 .map_err(|error| format!("proof completion: {error}"))?;
+            if matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ) {
+                return Err(format!(
+                    "{TERMINAL_CREDENTIAL_ERROR} proof completion was rejected"
+                ));
+            }
             if response.status() == StatusCode::CONFLICT {
                 return Err("proof completed after its lease expired".into());
+            }
+            if completion_rejection_is_permanent(response.status()) {
+                self.report_failure(
+                    &token,
+                    &claim,
+                    proof_failure(
+                        ProofFailureClass::PermanentProverRejection,
+                        "INVALID_PROVER_RESULT",
+                        None,
+                    ),
+                )
+                .await?;
+                return Err("coordinator rejected the prover result".into());
             }
             if !response.status().is_success() {
                 return Err(format!(
@@ -413,12 +544,139 @@ impl Worker {
         eprintln!("proof job complete");
         Ok(())
     }
+
+    async fn run_prover(&self, artifact: Vec<u8>) -> Result<ProveResult, ProofFailure> {
+        let response = self
+            .http
+            .post(&self.stwo_url)
+            .header("content-type", "application/json")
+            .body(artifact)
+            .send()
+            .await
+            .map_err(|_| {
+                proof_failure(
+                    ProofFailureClass::TransientNetwork,
+                    "PROVER_REQUEST_FAILED",
+                    None,
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(classify_prover_http(response.status()));
+        }
+        let bytes = Zeroizing::new(
+            read_bounded(response, MAX_RESPONSE_BYTES)
+                .await
+                .map_err(classify_prover_response_read)?,
+        );
+        let response: ProveResponse = serde_json::from_slice(&bytes).map_err(|_| {
+            proof_failure(
+                ProofFailureClass::PermanentProverRejection,
+                "MALFORMED_PROVER_RESPONSE",
+                None,
+            )
+        })?;
+        interpret_prover_response(response)
+    }
+
+    async fn report_failure(
+        &self,
+        token: &str,
+        claim: &ProofJobClaim,
+        failure: ProofFailure,
+    ) -> Result<(), String> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/internal/proof-jobs/{}/fail",
+                self.queue_url, claim.descriptor.job_id
+            ))
+            .bearer_auth(token)
+            .json(&FailProofJob {
+                lease_id: claim.lease_id.clone(),
+                prover_build_id: self.capabilities.prover_build_id.clone(),
+                request_hash: claim.descriptor.request_hash.clone(),
+                failure,
+            })
+            .send()
+            .await
+            .map_err(|_| "proof failure report could not reach the coordinator".to_string())?;
+        if response.status() == StatusCode::CONFLICT {
+            return Err("proof failed after its lease expired".into());
+        }
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return Err(format!(
+                "{TERMINAL_CREDENTIAL_ERROR} proof failure report was rejected"
+            ));
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "proof failure report returned http {}",
+                response.status()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_prover_result(result: ProveResult) -> Result<ProveResult, ProofFailure> {
+    if result
+        .resource_usage
+        .as_ref()
+        .is_some_and(|usage| usage.validate_measurement().is_err())
+    {
+        return Err(proof_failure(
+            ProofFailureClass::PermanentProverRejection,
+            "INVALID_RESOURCE_USAGE",
+            None,
+        ));
+    }
+    Ok(result)
+}
+
+fn interpret_prover_response(response: ProveResponse) -> Result<ProveResult, ProofFailure> {
+    if response.jsonrpc != "2.0" || response.id != 1 {
+        return Err(proof_failure(
+            ProofFailureClass::PermanentProverRejection,
+            "INVALID_JSON_RPC_ENVELOPE",
+            None,
+        ));
+    }
+    match (response.result, response.error) {
+        (Some(result), None) => validate_prover_result(result),
+        (None, Some(error)) => Err(classify_prover_error(error.code, error.data)),
+        (Some(_), Some(_)) => Err(proof_failure(
+            ProofFailureClass::PermanentProverRejection,
+            "AMBIGUOUS_PROVER_RESPONSE",
+            None,
+        )),
+        (None, None) => Err(proof_failure(
+            ProofFailureClass::PermanentProverRejection,
+            "EMPTY_PROVER_RESPONSE",
+            None,
+        )),
+    }
 }
 
 fn required_session_lifetime(max_proof_duration: Duration, lease_duration_ms: u64) -> u64 {
     u64::try_from(max_proof_duration.as_millis())
         .unwrap_or(u64::MAX)
         .saturating_add(lease_duration_ms)
+}
+
+fn validate_worker_resource_limits(
+    lease_duration_ms: u64,
+    max_request_bytes: u64,
+) -> Result<(), String> {
+    if lease_duration_ms == 0
+        || max_request_bytes == 0
+        || usize::try_from(max_request_bytes).is_err()
+    {
+        return Err("coordinator signed invalid worker resource limits".into());
+    }
+    Ok(())
 }
 
 fn session_needs_refresh(
@@ -460,6 +718,14 @@ async fn renew_lease(
                     .send()
                     .await
                     .map_err(|error| format!("proof lease heartbeat: {error}"))?;
+                if matches!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) {
+                    return Err(format!(
+                        "{TERMINAL_CREDENTIAL_ERROR} proof lease heartbeat was rejected"
+                    ));
+                }
                 if !response.status().is_success() {
                     return Err(format!(
                         "proof lease heartbeat returned http {}",
@@ -487,26 +753,65 @@ fn verify_config_mac(
     Ok(())
 }
 
-async fn read_bounded(response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
+async fn read_bounded(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, BoundedReadError> {
     if response
         .content_length()
         .is_some_and(|length| length > max_bytes as u64)
     {
-        return Err(format!("response exceeds {max_bytes} bytes"));
+        return Err(BoundedReadError::TooLarge { maximum: max_bytes });
     }
     let mut response = response;
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| format!("response read: {error}"))?
+        .map_err(|_| BoundedReadError::Transport)?
     {
-        if bytes.len() + chunk.len() > max_bytes {
-            return Err(format!("response exceeds {max_bytes} bytes"));
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > max_bytes)
+        {
+            return Err(BoundedReadError::TooLarge { maximum: max_bytes });
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+fn bounded_request_size(request_bytes: u64, maximum: u64) -> Result<usize, ProofFailure> {
+    if request_bytes == 0 || request_bytes > maximum {
+        return Err(proof_failure(
+            ProofFailureClass::InvalidArtifact,
+            "ARTIFACT_TOO_LARGE",
+            None,
+        ));
+    }
+    usize::try_from(request_bytes).map_err(|_| {
+        proof_failure(
+            ProofFailureClass::InvalidArtifact,
+            "ARTIFACT_TOO_LARGE",
+            None,
+        )
+    })
+}
+
+fn classify_prover_response_read(error: BoundedReadError) -> ProofFailure {
+    match error {
+        BoundedReadError::TooLarge { .. } => proof_failure(
+            ProofFailureClass::PermanentProverRejection,
+            "PROVER_RESPONSE_TOO_LARGE",
+            None,
+        ),
+        BoundedReadError::Transport => proof_failure(
+            ProofFailureClass::TransientNetwork,
+            "PROVER_RESPONSE_READ_FAILED",
+            None,
+        ),
+    }
 }
 
 fn sanitize(value: &str) -> String {
@@ -532,8 +837,72 @@ fn sanitize(value: &str) -> String {
     output.chars().take(512).collect()
 }
 
-fn prover_error(code: i64) -> String {
-    format!("stwo prover error code {code}")
+fn proof_failure(class: ProofFailureClass, code: &str, component: Option<&str>) -> ProofFailure {
+    ProofFailure {
+        class,
+        code: code.into(),
+        component: component.map(str::to_owned),
+        profile_id: None,
+        required: None,
+        available: None,
+    }
+}
+
+fn classify_prover_http(status: StatusCode) -> ProofFailure {
+    if matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
+    {
+        proof_failure(
+            ProofFailureClass::TransientProverUnavailable,
+            "PROVER_HTTP_UNAVAILABLE",
+            None,
+        )
+    } else {
+        proof_failure(
+            ProofFailureClass::PermanentProverRejection,
+            "PROVER_HTTP_REJECTED",
+            None,
+        )
+    }
+}
+
+fn completion_rejection_is_permanent(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+    )
+}
+
+fn classify_prover_error(code: i64, data: Option<StructuredProverFailure>) -> ProofFailure {
+    if let Some(data) = data {
+        let failure = ProofFailure {
+            class: data.class,
+            code: data.code,
+            component: data.component,
+            profile_id: data.profile_id,
+            required: data.required,
+            available: data.available,
+        };
+        if data.schema_version == 1 && failure.validate().is_ok() {
+            return failure;
+        }
+        return proof_failure(
+            ProofFailureClass::PermanentProverRejection,
+            "INVALID_FAILURE_ADAPTER_DATA",
+            None,
+        );
+    }
+    let code = match code {
+        -32700 => "PROVER_PARSE_ERROR",
+        -32600 => "INVALID_PROVER_REQUEST",
+        -32601 => "PROVER_METHOD_NOT_FOUND",
+        -32602 => "INVALID_PROVER_PARAMS",
+        -32603 => "PROVER_INTERNAL_ERROR",
+        _ => "UNCLASSIFIED_PROVER_REJECTION",
+    };
+    proof_failure(ProofFailureClass::PermanentProverRejection, code, None)
 }
 
 fn now_ms() -> u64 {
@@ -587,6 +956,38 @@ fn verify_compiled_pin(label: &str, runtime: &str, compiled: Option<&str>) -> Re
 mod tests {
     use super::*;
 
+    fn resource_usage() -> ProofResourceUsage {
+        let components = [
+            "bitwise",
+            "cpu",
+            "ec_op",
+            "ecdsa",
+            "pedersen",
+            "poseidon",
+            "range_check",
+        ];
+        let mut usage = ProofResourceUsage {
+            component_registry_id: String::new(),
+            raw_snos_steps: 1,
+            adapted_rows: 1,
+            memory_words: 1,
+            memory_holes: 0,
+            builtin_instances: components
+                .into_iter()
+                .map(|component| (component.into(), 1))
+                .collect(),
+            component_log_sizes: components
+                .into_iter()
+                .map(|component| (component.into(), 1))
+                .collect(),
+            max_domain_log_size: 1,
+            peak_rss_bytes: 1,
+            wall_time_ms: 1,
+        };
+        usage.component_registry_id = usage.expected_component_registry_id().unwrap();
+        usage
+    }
+
     #[test]
     fn the_queue_requires_tls_outside_private_networks() {
         assert!(validate_queue_url("https://control.zylith.fi").is_ok());
@@ -623,6 +1024,27 @@ mod tests {
     }
 
     #[test]
+    fn structured_resource_usage_is_optional_but_never_partially_trusted() {
+        let valid = ProveResult {
+            proof: "proof".into(),
+            proof_facts: Vec::new(),
+            resource_usage: Some(resource_usage()),
+        };
+        assert!(validate_prover_result(valid).is_ok());
+        let mut malformed = resource_usage();
+        malformed.component_log_sizes.remove("poseidon");
+        let failure = validate_prover_result(ProveResult {
+            proof: "proof".into(),
+            proof_facts: Vec::new(),
+            resource_usage: Some(malformed),
+        })
+        .err()
+        .unwrap();
+        assert_eq!(failure.class, ProofFailureClass::PermanentProverRejection);
+        assert_eq!(failure.code, "INVALID_RESOURCE_USAGE");
+    }
+
+    #[test]
     fn prover_errors_cannot_echo_witness_values() {
         let secret_hex = format!("0x{}", "ab".repeat(32));
         let secret_decimal = "1234567890123456789012345678901234567890";
@@ -631,6 +1053,233 @@ mod tests {
         assert!(!sanitized.contains(&secret_hex));
         assert!(!sanitized.contains(secret_decimal));
         assert_eq!(sanitized.matches("<redacted>").count(), 2);
-        assert_eq!(prover_error(-32_001), "stwo prover error code -32001");
+        let response: ProveResponse = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32001,
+                "message": message,
+                "data": null
+            }
+        }))
+        .unwrap();
+        let failure = classify_prover_error(-32001, response.error.unwrap().data);
+        assert_eq!(
+            failure,
+            proof_failure(
+                ProofFailureClass::PermanentProverRejection,
+                "UNCLASSIFIED_PROVER_REJECTION",
+                None,
+            )
+        );
+        assert!(
+            !serde_json::to_string(&failure)
+                .unwrap()
+                .contains("invalid witness")
+        );
+    }
+
+    #[test]
+    fn structured_adapter_classifies_capacity_without_reading_the_message() {
+        let response: ProveResponse = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32001,
+                "message": "secret witness text that must never leave the worker",
+                "data": {
+                    "schema_version": 1,
+                    "class": "CAPACITY_EXCEEDED",
+                    "code": "TRACE_DOMAIN_EXCEEDED",
+                    "component": "POSEIDON",
+                    "profile_id": "proof1-log20",
+                    "required": 1079477,
+                    "available": 1048576
+                }
+            }
+        }))
+        .unwrap();
+        let failure = classify_prover_error(-32001, response.error.unwrap().data);
+        assert_eq!(failure.class, ProofFailureClass::CapacityExceeded);
+        assert_eq!(failure.component.as_deref(), Some("POSEIDON"));
+        assert_eq!(failure.required, Some(1_079_477));
+        assert_eq!(failure.available, Some(1_048_576));
+        assert!(!serde_json::to_string(&failure).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn success_plus_error_is_a_permanent_ambiguous_response() {
+        let response: ProveResponse = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "proof": "proof",
+                "proof_facts": []
+            },
+            "error": {
+                "code": -32001,
+                "message": "must stay ignored",
+                "data": {
+                    "schema_version": 1,
+                    "class": "TRANSIENT_NETWORK",
+                    "code": "NETWORK",
+                    "component": null,
+                    "profile_id": null,
+                    "required": null,
+                    "available": null
+                }
+            }
+        }))
+        .unwrap();
+        let failure = match interpret_prover_response(response) {
+            Err(failure) => failure,
+            Ok(_) => panic!("ambiguous response was accepted"),
+        };
+        assert_eq!(failure.class, ProofFailureClass::PermanentProverRejection);
+        assert_eq!(failure.code, "AMBIGUOUS_PROVER_RESPONSE");
+    }
+
+    #[test]
+    fn malformed_or_unknown_adapter_data_fails_closed() {
+        let unknown = serde_json::from_value::<ProveResponse>(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32001,
+                "message": "ignored",
+                "data": {
+                    "schema_version": 1,
+                    "class": "SOMETHING_NEW",
+                    "code": "NEW",
+                    "component": null,
+                    "profile_id": null,
+                    "required": null,
+                    "available": null
+                }
+            }
+        }));
+        assert!(unknown.is_err());
+
+        for malformed in [
+            serde_json::json!({
+                "jsonrpc": "1.0",
+                "id": 1,
+                "result": { "proof": "proof", "proof_facts": [] }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": { "proof": "proof", "proof_facts": [] }
+            }),
+        ] {
+            let failure = interpret_prover_response(serde_json::from_value(malformed).unwrap())
+                .err()
+                .unwrap();
+            assert_eq!(failure.class, ProofFailureClass::PermanentProverRejection);
+            assert_eq!(failure.code, "INVALID_JSON_RPC_ENVELOPE");
+        }
+
+        for extended in [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "proof": "proof", "proof_facts": [] },
+                "extra": true
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "proof": "proof", "proof_facts": [], "extra": true }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32001, "message": "ignored", "data": null, "extra": true }
+            }),
+        ] {
+            assert!(serde_json::from_value::<ProveResponse>(extended).is_err());
+        }
+
+        let malformed = StructuredProverFailure {
+            schema_version: 2,
+            class: ProofFailureClass::CapacityExceeded,
+            code: "TRACE_DOMAIN_EXCEEDED".into(),
+            component: Some("POSEIDON".into()),
+            profile_id: None,
+            required: Some(1),
+            available: Some(2),
+        };
+        assert_eq!(
+            classify_prover_error(-32001, Some(malformed)).code,
+            "INVALID_FAILURE_ADAPTER_DATA"
+        );
+    }
+
+    #[test]
+    fn transport_and_http_failures_have_closed_retry_semantics() {
+        assert!(validate_worker_resource_limits(1, 1).is_ok());
+        assert!(validate_worker_resource_limits(0, 1).is_err());
+        assert!(validate_worker_resource_limits(1, 0).is_err());
+        assert_eq!(bounded_request_size(1, 1).unwrap(), 1);
+        for (requested, maximum) in [(0, 1), (2, 1)] {
+            let failure = bounded_request_size(requested, maximum).unwrap_err();
+            assert_eq!(failure.class, ProofFailureClass::InvalidArtifact);
+            assert_eq!(failure.code, "ARTIFACT_TOO_LARGE");
+        }
+        assert_eq!(
+            classify_prover_http(StatusCode::SERVICE_UNAVAILABLE).class,
+            ProofFailureClass::TransientProverUnavailable
+        );
+        assert_eq!(
+            classify_prover_http(StatusCode::TOO_MANY_REQUESTS).class,
+            ProofFailureClass::TransientProverUnavailable
+        );
+        assert_eq!(
+            classify_prover_http(StatusCode::REQUEST_TIMEOUT).class,
+            ProofFailureClass::TransientProverUnavailable
+        );
+        assert_eq!(
+            classify_prover_http(StatusCode::TOO_EARLY).class,
+            ProofFailureClass::TransientProverUnavailable
+        );
+        assert_eq!(
+            classify_prover_http(StatusCode::BAD_REQUEST).class,
+            ProofFailureClass::PermanentProverRejection
+        );
+        assert_eq!(
+            proof_failure(
+                ProofFailureClass::TransientNetwork,
+                "PROVER_REQUEST_FAILED",
+                None,
+            )
+            .class,
+            ProofFailureClass::TransientNetwork
+        );
+        assert_eq!(
+            classify_prover_error(-32602, None).code,
+            "INVALID_PROVER_PARAMS"
+        );
+        assert_eq!(
+            classify_prover_response_read(BoundedReadError::TooLarge { maximum: 1 }).class,
+            ProofFailureClass::PermanentProverRejection
+        );
+        assert_eq!(
+            classify_prover_response_read(BoundedReadError::TooLarge { maximum: 1 }).code,
+            "PROVER_RESPONSE_TOO_LARGE"
+        );
+        assert_eq!(
+            classify_prover_response_read(BoundedReadError::Transport).class,
+            ProofFailureClass::TransientNetwork
+        );
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(completion_rejection_is_permanent(status));
+        }
+        assert!(!completion_rejection_is_permanent(
+            StatusCode::SERVICE_UNAVAILABLE
+        ));
     }
 }

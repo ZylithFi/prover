@@ -15,4 +15,5 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 url = "2"
+zeroize = "1"
 zylith-proof-job = { path = "../proof_job" }
