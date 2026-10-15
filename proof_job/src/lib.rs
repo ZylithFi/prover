@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 pub const PROOF_JOB_SCHEMA_VERSION: u32 = 2;
 pub const PROOF_CAPACITY_SCHEMA_VERSION: u32 = 4;
 pub const PROOF_VALIDITY_HEADROOM_BLOCKS: u64 = 5;
-pub const TRANSITION_STATEMENT_VERSION: &str = "zylith-transition-v2";
+pub const TRANSITION_STATEMENT_VERSION: &str = "zylith-transition-v1";
 pub const WITHDRAWAL_STATEMENT_VERSION: &str = "zylith-withdrawal-v1";
-pub const RESIDUAL_RECOVERY_STATEMENT_VERSION: &str = "zylith-residual-recovery-v2";
+pub const RESIDUAL_RECOVERY_STATEMENT_VERSION: &str = "zylith-residual-recovery-v1";
 pub const VIRTUAL_PROGRAM_VARIANT: &str = "VIRTUAL_SNOS";
 pub const STARKNET_OS_OUTPUT_VERSION: &str = "VIRTUAL_SNOS0";
 const JOB_ID_DOMAIN: &str = "zylith/proof-job/id/v1:";
@@ -865,7 +865,7 @@ mod tests {
             starknet_os_config_hash: "0x3".into(),
             proof_account_class_hash: "0x4".into(),
             proof_program_class_hash: "0x5".into(),
-            statement_version: "transition-v2".into(),
+            statement_version: TRANSITION_STATEMENT_VERSION.into(),
         };
         let limits = ProofShapeLimits {
             markets: 3,
